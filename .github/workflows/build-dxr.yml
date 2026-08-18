@@ -1,0 +1,125 @@
+name: Build Microsoft DXR Samples
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-dxr.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Clone Microsoft DirectX samples
+        shell: pwsh
+        run: git clone --depth 1 --branch master https://github.com/microsoft/DirectX-Graphics-Samples.git dxsamples
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
+
+      - name: Set up NuGet
+        uses: NuGet/setup-nuget@v3
+
+      - name: Restore DXR NuGet packages
+        shell: pwsh
+        run: |
+          $root = (Resolve-Path 'dxsamples').Path
+          $packageDir = Join-Path $root 'Packages'
+          $configs = Get-ChildItem (Join-Path $root 'Samples\Desktop\D3D12Raytracing\src') -Recurse -Filter packages.config
+          Write-Host "Found $($configs.Count) packages.config files"
+          foreach ($cfg in $configs) {
+            Write-Host "Restoring $($cfg.FullName)"
+            & nuget restore $cfg.FullName -PackagesDirectory $packageDir -Source https://api.nuget.org/v3/index.json -NonInteractive
+            if ($LASTEXITCODE -ne 0) { throw "NuGet restore failed for $($cfg.FullName)" }
+          }
+
+      - name: Build tutorial samples Release x64
+        shell: pwsh
+        run: |
+          $base = 'dxsamples\Samples\Desktop\D3D12Raytracing\src'
+          $projects = @(
+            'D3D12RaytracingHelloWorld\D3D12RaytracingHelloWorld.vcxproj',
+            'D3D12RaytracingSimpleLighting\D3D12RaytracingSimpleLighting.vcxproj',
+            'D3D12RaytracingProceduralGeometry\D3D12RaytracingProceduralGeometry.vcxproj',
+            'D3D12RaytracingLibrarySubobjects\D3D12RaytracingLibrarySubobjects.vcxproj',
+            'D3D12RaytracingHelloShaderExecutionReordering\D3D12RaytracingHelloShaderExecutionReordering.vcxproj',
+            'D3D12RaytracingSakuraForestSER\D3D12RaytracingSakuraForestSER.vcxproj',
+            'D3D12RaytracingOpacityMicromaps\D3D12RaytracingOpacityMicromaps.vcxproj'
+          )
+
+          $summary = @()
+          $successCount = 0
+          foreach ($relative in $projects) {
+            $project = Join-Path $base $relative
+            $name = Split-Path (Split-Path $project -Parent) -Leaf
+            Write-Host "`n========== BUILD $name =========="
+            & msbuild $project /m:1 /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+            if ($LASTEXITCODE -eq 0) {
+              $summary += "SUCCESS $name"
+              $successCount++
+            } else {
+              $summary += "FAILED  $name (exit $LASTEXITCODE)"
+              Write-Warning "$name failed; continuing with remaining samples."
+            }
+          }
+
+          $summary | Tee-Object -FilePath build-summary.txt
+          if ($successCount -eq 0) { throw 'No tutorial sample compiled successfully.' }
+
+      - name: Attempt complete solution including advanced samples
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          msbuild dxsamples\Samples\Desktop\D3D12Raytracing\src\D3D12Raytracing.slnx /m:1 /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+
+      - name: Collect compiled samples
+        if: always()
+        shell: pwsh
+        run: |
+          $root = (Resolve-Path 'dxsamples').Path
+          $stage = Join-Path $PWD 'DXR-All-Samples'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $src = Join-Path $root 'Samples\Desktop\D3D12Raytracing\src'
+          $releaseDirs = Get-ChildItem $src -Recurse -Directory | Where-Object {
+            $_.FullName -match '\\bin\\x64\\Release$'
+          }
+
+          foreach ($dir in $releaseDirs) {
+            $projectName = Split-Path (Split-Path (Split-Path $dir.FullName -Parent) -Parent) -Leaf
+            $dest = Join-Path $stage $projectName
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            Copy-Item (Join-Path $dir.FullName '*') $dest -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          $miniEngineOut = Join-Path $root 'Samples\Desktop\D3D12Raytracing\Build\x64\Release\Output'
+          if (Test-Path $miniEngineOut) {
+            $dest = Join-Path $stage 'Advanced-MiniEngine'
+            Copy-Item $miniEngineOut $dest -Recurse -Force
+          }
+
+          if (Test-Path 'build-summary.txt') {
+            Copy-Item 'build-summary.txt' (Join-Path $stage 'build-summary.txt') -Force
+          }
+
+          Write-Host "`nCompiled executables:"
+          $exes = Get-ChildItem $stage -Recurse -Filter *.exe -File
+          $exes | ForEach-Object { Write-Host $_.FullName }
+          if ($exes.Count -eq 0) { throw 'No EXE files were collected.' }
+
+      - name: Upload compiled DXR samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: D3D12Raytracing-All-Samples-Release-x64
+          path: DXR-All-Samples/**
+          if-no-files-found: error
+          retention-days: 7
