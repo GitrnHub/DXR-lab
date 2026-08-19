@@ -20,11 +20,61 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Clone Microsoft DirectX samples
+      - name: Checkout DXR lab
+        uses: actions/checkout@v4
+
+      - name: Clone pinned Microsoft DirectX samples
         shell: pwsh
         run: |
+          $revision = '213dd4fd4918ea009dd8f35adee1aff1f2ecaba4'
           git clone --depth 1 --branch master https://github.com/microsoft/DirectX-Graphics-Samples.git dxsamples
-          Set-Content -Path microsoft-source-revision.txt -Value (git -C dxsamples rev-parse HEAD)
+          if ((git -C dxsamples rev-parse HEAD).Trim() -ne $revision) {
+            git -C dxsamples fetch --depth 1 origin $revision
+            git -C dxsamples checkout --detach $revision
+          }
+          $actual = (git -C dxsamples rev-parse HEAD).Trim()
+          if ($actual -ne $revision) { throw "Unexpected Microsoft source revision: $actual" }
+          Set-Content -Path microsoft-source-revision.txt -Value $actual
+
+      - name: Apply upstream Sakura Release fix
+        shell: pwsh
+        run: |
+          $project = 'dxsamples\Samples\Desktop\D3D12Raytracing\src\D3D12RaytracingSakuraForestSER\D3D12RaytracingSakuraForestSER.vcxproj'
+          [xml]$doc = Get-Content -Raw $project
+          $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
+          $ns.AddNamespace('msb', 'http://schemas.microsoft.com/developer/msbuild/2003')
+          $releaseCondition = "'`$(Configuration)|`$(Platform)'=='Release|x64'"
+
+          $releaseGroup = $doc.SelectSingleNode("//msb:ItemDefinitionGroup[contains(@Condition,'Release|x64')]", $ns)
+          if ($null -eq $releaseGroup) { throw 'Sakura Release x64 ItemDefinitionGroup not found.' }
+          $cl = $releaseGroup.SelectSingleNode('msb:ClCompile', $ns)
+          if ($null -eq $cl) { throw 'Sakura Release x64 ClCompile node not found.' }
+          if ($null -eq $cl.SelectSingleNode('msb:LanguageStandard', $ns)) {
+            $lang = $doc.CreateElement('LanguageStandard', $ns.LookupNamespace('msb'))
+            $lang.InnerText = 'stdcpp17'
+            [void]$cl.AppendChild($lang)
+          }
+
+          $fx = $doc.SelectSingleNode("//msb:FxCompile[@Include='Raytracing.hlsl']", $ns)
+          if ($null -eq $fx) { throw 'Sakura Raytracing.hlsl FxCompile node not found.' }
+          $alreadyExcluded = $false
+          foreach ($node in $fx.SelectNodes('msb:ExcludedFromBuild', $ns)) {
+            if ($node.GetAttribute('Condition') -eq $releaseCondition) { $alreadyExcluded = $true }
+          }
+          if (!$alreadyExcluded) {
+            $excluded = $doc.CreateElement('ExcludedFromBuild', $ns.LookupNamespace('msb'))
+            $excluded.SetAttribute('Condition', $releaseCondition)
+            $excluded.InnerText = 'true'
+            [void]$fx.AppendChild($excluded)
+          }
+          $doc.Save((Resolve-Path $project))
+
+          [xml]$verify = Get-Content -Raw $project
+          $verifyNs = New-Object System.Xml.XmlNamespaceManager($verify.NameTable)
+          $verifyNs.AddNamespace('msb', 'http://schemas.microsoft.com/developer/msbuild/2003')
+          $releaseExcluded = $verify.SelectNodes("//msb:FxCompile[@Include='Raytracing.hlsl']/msb:ExcludedFromBuild", $verifyNs) | Where-Object { $_.GetAttribute('Condition') -eq $releaseCondition }
+          if ($releaseExcluded.Count -ne 1) { throw 'Sakura upstream Release patch verification failed.' }
+          Write-Host 'Applied the two effective changes from Microsoft PR #926 to the current Sakura project.'
 
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v3
@@ -47,7 +97,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "NuGet restore failed for $($cfg.FullName)" }
           }
 
-      - name: Build seven tutorial samples into project-local output
+      - name: Build all seven tutorial samples Release x64
         shell: pwsh
         run: |
           $base = (Resolve-Path 'dxsamples\Samples\Desktop\D3D12Raytracing\src').Path
@@ -60,7 +110,6 @@ jobs:
             'D3D12RaytracingSakuraForestSER\D3D12RaytracingSakuraForestSER.vcxproj',
             'D3D12RaytracingOpacityMicromaps\D3D12RaytracingOpacityMicromaps.vcxproj'
           )
-
           $summary = @()
           foreach ($relative in $projects) {
             $project = Join-Path $base $relative
@@ -74,7 +123,7 @@ jobs:
           }
           $summary | Set-Content tutorial-build-summary.txt
 
-      - name: Build advanced RTAO sample
+      - name: Build advanced RTAO Release x64
         shell: pwsh
         run: |
           $project = (Resolve-Path 'dxsamples\Samples\Desktop\D3D12Raytracing\src\D3D12RaytracingRealTimeDenoisedAmbientOcclusion\D3D12RaytracingRealTimeDenoisedAmbientOcclusion.vcxproj').Path
@@ -83,14 +132,14 @@ jobs:
           $exe = Join-Path (Split-Path $project -Parent) 'bin\x64\Release\D3D12RaytracingRealTimeDenoisedAmbientOcclusion.exe'
           if (!(Test-Path $exe)) { throw "RTAO executable not found: $exe" }
 
-      - name: Build MiniEngine sample and dependencies
+      - name: Build MiniEngine sample without rebuilding unrelated DXR samples
         shell: pwsh
         run: |
-          # Build through the official DXR solution so MiniEngine's SolutionDir-based
-          # shader/output paths and Core/Model project references are preserved.
-          $solution = (Resolve-Path 'dxsamples\Samples\Desktop\D3D12Raytracing\src\D3D12Raytracing.slnx').Path
-          & msbuild $solution /m:1 /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
-          if ($LASTEXITCODE -ne 0) { throw "DXR solution / MiniEngine build failed (exit $LASTEXITCODE)." }
+          $src = (Resolve-Path 'dxsamples\Samples\Desktop\D3D12Raytracing\src').Path
+          $project = Join-Path $src 'D3D12RaytracingMiniEngineSample\ModelViewer_VS16.vcxproj'
+          $solutionDir = "$src\"
+          & msbuild $project /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=x64 "/p:SolutionDir=$solutionDir" /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { throw "MiniEngine sample failed to build (exit $LASTEXITCODE)." }
           $exe = 'dxsamples\Samples\Desktop\D3D12Raytracing\Build\x64\Release\Output\D3D12RaytracingMiniEngineSample\D3D12RaytracingMiniEngineSample.exe'
           if (!(Test-Path $exe)) { throw "MiniEngine executable not found: $exe" }
 
@@ -107,40 +156,36 @@ jobs:
 
           function Copy-RuntimeTree([string]$source, [string]$destination) {
             New-Item -ItemType Directory -Force -Path $destination | Out-Null
-            # Keep runtime HLSL/includes, models, textures, OMM binaries, fonts and
-            # nested asset directories. Exclude C++ build intermediates/project files.
-            $files = Get-ChildItem $source -Recurse -File
-            foreach ($file in $files) {
+            foreach ($file in (Get-ChildItem $source -Recurse -File)) {
               $relative = $file.FullName.Substring($source.Length).TrimStart('\')
               if ($relative -match '(^|\\)(bin|obj|\.vs)(\\|$)') { continue }
               if ($file.Extension -in @('.cpp','.vcxproj','.filters','.user','.pdb','.lib','.exp')) { continue }
               if ($file.Name -eq 'packages.config') { continue }
               $target = Join-Path $destination $relative
-              $parent = Split-Path $target -Parent
-              New-Item -ItemType Directory -Force -Path $parent | Out-Null
+              New-Item -ItemType Directory -Force -Path (Split-Path $target -Parent) | Out-Null
               Copy-Item $file.FullName $target -Force
             }
           }
 
           function Write-Launchers([string]$destination, [string]$exeName) {
-            $run = @"
-          @echo off
-          cd /d "%~dp0"
-          start "" "%~dp0$exeName" %*
-          "@
-            $diag = @"
-          @echo off
-          cd /d "%~dp0"
-          echo Running $exeName from:
-          cd
-          echo.
-          "$exeName" %*
-          echo.
-          echo Exit code: %ERRORLEVEL%
-          pause
-          "@
-            Set-Content -Path (Join-Path $destination 'RUN.cmd') -Value $run -Encoding ascii
-            Set-Content -Path (Join-Path $destination 'RUN_DIAGNOSTIC.cmd') -Value $diag -Encoding ascii
+            $runLines = @(
+              '@echo off',
+              'cd /d "%~dp0"',
+              "start `"`" `"%~dp0$exeName`" %*"
+            )
+            $diagLines = @(
+              '@echo off',
+              'cd /d "%~dp0"',
+              "echo Running $exeName from:",
+              'cd',
+              'echo.',
+              "`"$exeName`" %*",
+              'echo.',
+              'echo Exit code: %ERRORLEVEL%',
+              'pause'
+            )
+            Set-Content -Path (Join-Path $destination 'RUN.cmd') -Value $runLines -Encoding ascii
+            Set-Content -Path (Join-Path $destination 'RUN_DIAGNOSTIC.cmd') -Value $diagLines -Encoding ascii
           }
 
           $tutorials = @(
@@ -164,7 +209,16 @@ jobs:
             Write-Launchers $dest $sample.Exe
           }
 
-          # Advanced 1: RTAO loads Assets\... by relative path at runtime.
+          # SER samples compile HLSL at runtime. Explicitly place x64 DXC runtime
+          # next to them even if an MSBuild target changes its copy behavior.
+          $dxcRoot = Get-ChildItem (Join-Path $root 'Packages') -Directory -Filter 'Microsoft.Direct3D.DXC.*' | Sort-Object Name -Descending | Select-Object -First 1
+          if ($null -eq $dxcRoot) { throw 'Microsoft.Direct3D.DXC package directory not found.' }
+          $dxcFiles = Get-ChildItem $dxcRoot.FullName -Recurse -File | Where-Object { $_.Name -in @('dxcompiler.dll','dxil.dll') -and $_.FullName -match '\\x64\\' }
+          foreach ($serFolder in @('05-HelloSER','06-SakuraForestSER')) {
+            $dest = Join-Path (Join-Path $stage 'Tutorials') $serFolder
+            foreach ($dll in $dxcFiles) { Copy-Item $dll.FullName $dest -Force }
+          }
+
           $rtaoProject = Join-Path $src 'D3D12RaytracingRealTimeDenoisedAmbientOcclusion'
           $rtaoDest = Join-Path (Join-Path $stage 'Advanced') '01-RealTimeDenoisedAmbientOcclusion'
           Copy-RuntimeTree $rtaoProject $rtaoDest
@@ -174,15 +228,12 @@ jobs:
           if (!(Test-Path (Join-Path $rtaoDest 'Assets'))) { throw 'Packaged RTAO Assets folder missing.' }
           Write-Launchers $rtaoDest $rtaoExe
 
-          # Advanced 2: MiniEngine explicitly loads Sponza/sponza.h3d and textures.
           $miniOut = Join-Path $root 'Samples\Desktop\D3D12Raytracing\Build\x64\Release\Output\D3D12RaytracingMiniEngineSample'
           $miniProject = Join-Path $src 'D3D12RaytracingMiniEngineSample'
           $miniDest = Join-Path (Join-Path $stage 'Advanced') '02-MiniEngine'
           New-Item -ItemType Directory -Force -Path $miniDest | Out-Null
           Copy-Item (Join-Path $miniOut '*') $miniDest -Recurse -Force
-          if (Test-Path (Join-Path $miniProject 'Textures')) {
-            Copy-Item (Join-Path $miniProject 'Textures') $miniDest -Recurse -Force
-          }
+          if (Test-Path (Join-Path $miniProject 'Textures')) { Copy-Item (Join-Path $miniProject 'Textures') $miniDest -Recurse -Force }
           $sponzaSource = Join-Path $root 'MiniEngine\ModelViewer\Sponza'
           if (!(Test-Path $sponzaSource)) { throw "Sponza source folder missing: $sponzaSource" }
           Copy-Item $sponzaSource $miniDest -Recurse -Force
@@ -194,50 +245,23 @@ jobs:
 
           Copy-Item microsoft-source-revision.txt (Join-Path $stage 'microsoft-source-revision.txt') -Force
           Copy-Item tutorial-build-summary.txt (Join-Path $stage 'tutorial-build-summary.txt') -Force
+          Set-Content -Path (Join-Path $stage 'README-RUN-FIRST.txt') -Encoding utf8 -Value @(
+            'Microsoft DirectX Raytracing runnable samples - Release x64',
+            '',
+            'Do not move an EXE out of its sample folder. Runtime assets are kept beside each EXE.',
+            'Launch RUN.cmd. If a sample closes immediately, launch RUN_DIAGNOSTIC.cmd.',
+            '',
+            'Tutorials: 01 HelloWorld, 02 SimpleLighting, 03 ProceduralGeometry, 04 LibrarySubobjects, 05 HelloSER, 06 SakuraForestSER, 07 OpacityMicromaps',
+            'Advanced: 01 RealTimeDenoisedAmbientOcclusion, 02 MiniEngine',
+            '',
+            'Sakura Release x64 is locally patched with the effective changes from upstream Microsoft PR #926.'
+          )
 
-          $rootReadme = @'
-          Microsoft DirectX Raytracing runnable samples - Release x64
-
-          IMPORTANT
-          =========
-          Do not move an EXE out of its sample folder. Several Microsoft samples
-          load HLSL, models, textures, fonts, OMM data, or PBRT assets by relative
-          path at runtime.
-
-          Recommended launch method:
-            1. Open one sample folder.
-            2. Double-click RUN.cmd.
-            3. If it closes immediately, use RUN_DIAGNOSTIC.cmd.
-
-          Layout
-          ======
-          Tutorials\01-HelloWorld
-          Tutorials\02-SimpleLighting
-          Tutorials\03-ProceduralGeometry
-          Tutorials\04-LibrarySubobjects
-          Tutorials\05-HelloSER
-          Tutorials\06-SakuraForestSER
-          Tutorials\07-OpacityMicromaps
-          Advanced\01-RealTimeDenoisedAmbientOcclusion
-          Advanced\02-MiniEngine
-
-          Modern feature note
-          ===================
-          HelloSER and Sakura Forest use Shader Model 6.9 / Shader Execution
-          Reordering. Opacity Micromaps requires DXR Tier 1.2. Use current Windows
-          updates and a current GPU driver.
-          '@
-          Set-Content -Path (Join-Path $stage 'README-RUN-FIRST.txt') -Value $rootReadme -Encoding utf8
-
-          Write-Host "`nPackaged executables:"
-          $exes = Get-ChildItem $stage -Recurse -Filter *.exe -File
-          $exes | ForEach-Object { Write-Host $_.FullName }
-          if ($exes.Count -lt 9) { throw "Expected at least 9 sample EXEs, found $($exes.Count)." }
-
-          Write-Host "`nRuntime asset checks:"
           $checks = @(
             'Tutorials\05-HelloSER\Raytracing.hlsl',
+            'Tutorials\05-HelloSER\dxcompiler.dll',
             'Tutorials\06-SakuraForestSER\Raytracing.hlsl',
+            'Tutorials\06-SakuraForestSER\dxcompiler.dll',
             'Tutorials\06-SakuraForestSER\trunk.obj',
             'Tutorials\07-OpacityMicromaps\treeModel.bin',
             'Tutorials\07-OpacityMicromaps\jacaranda_tree_leaves_alpha_4k.dds',
@@ -250,6 +274,10 @@ jobs:
             if (!(Test-Path $p)) { throw "Required runtime asset missing: $check" }
             Write-Host "OK  $check"
           }
+
+          $exes = Get-ChildItem $stage -Recurse -Filter *.exe -File
+          $exes | ForEach-Object { Write-Host $_.FullName }
+          if ($exes.Count -lt 9) { throw "Expected at least 9 sample EXEs, found $($exes.Count)." }
 
       - name: Upload runnable DXR samples
         uses: actions/upload-artifact@v4
