@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: dxr-build
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-2022
@@ -103,18 +107,18 @@ jobs:
 
           function Copy-RuntimeTree([string]$source, [string]$destination) {
             New-Item -ItemType Directory -Force -Path $destination | Out-Null
-            # Preserve runtime-loaded HLSL/includes, models, textures, OMM binaries,
-            # sprite fonts and nested asset directories. Exclude build intermediates
-            # and C++/VS project files to keep the package readable.
-            Get-ChildItem $source -Recurse -File | ForEach-Object {
-              $relative = $_.FullName.Substring($source.Length).TrimStart('\')
-              if ($relative -match '(^|\\)(bin|obj|\.vs)(\\|$)') { return }
-              if ($_.Extension -in @('.cpp','.vcxproj','.filters','.user','.pdb','.lib','.exp')) { return }
-              if ($_.Name -eq 'packages.config') { return }
+            # Keep runtime HLSL/includes, models, textures, OMM binaries, fonts and
+            # nested asset directories. Exclude C++ build intermediates/project files.
+            $files = Get-ChildItem $source -Recurse -File
+            foreach ($file in $files) {
+              $relative = $file.FullName.Substring($source.Length).TrimStart('\')
+              if ($relative -match '(^|\\)(bin|obj|\.vs)(\\|$)') { continue }
+              if ($file.Extension -in @('.cpp','.vcxproj','.filters','.user','.pdb','.lib','.exp')) { continue }
+              if ($file.Name -eq 'packages.config') { continue }
               $target = Join-Path $destination $relative
               $parent = Split-Path $target -Parent
               New-Item -ItemType Directory -Force -Path $parent | Out-Null
-              Copy-Item $_.FullName $target -Force
+              Copy-Item $file.FullName $target -Force
             }
           }
 
@@ -160,8 +164,7 @@ jobs:
             Write-Launchers $dest $sample.Exe
           }
 
-          # Advanced 1: RTAO. The program loads Assets\... at runtime, so keep the
-          # full runtime tree beside the executable.
+          # Advanced 1: RTAO loads Assets\... by relative path at runtime.
           $rtaoProject = Join-Path $src 'D3D12RaytracingRealTimeDenoisedAmbientOcclusion'
           $rtaoDest = Join-Path (Join-Path $stage 'Advanced') '01-RealTimeDenoisedAmbientOcclusion'
           Copy-RuntimeTree $rtaoProject $rtaoDest
@@ -171,9 +174,7 @@ jobs:
           if (!(Test-Path (Join-Path $rtaoDest 'Assets'))) { throw 'Packaged RTAO Assets folder missing.' }
           Write-Launchers $rtaoDest $rtaoExe
 
-          # Advanced 2: MiniEngine. Its source explicitly loads Sponza/sponza.h3d
-          # and model textures by relative path; these are not present in the raw
-          # Build\...\Output directory, so add them here.
+          # Advanced 2: MiniEngine explicitly loads Sponza/sponza.h3d and textures.
           $miniOut = Join-Path $root 'Samples\Desktop\D3D12Raytracing\Build\x64\Release\Output\D3D12RaytracingMiniEngineSample'
           $miniProject = Join-Path $src 'D3D12RaytracingMiniEngineSample'
           $miniDest = Join-Path (Join-Path $stage 'Advanced') '02-MiniEngine'
@@ -233,7 +234,7 @@ jobs:
           $exes | ForEach-Object { Write-Host $_.FullName }
           if ($exes.Count -lt 9) { throw "Expected at least 9 sample EXEs, found $($exes.Count)." }
 
-          Write-Host "`nRuntime assets spot checks:"
+          Write-Host "`nRuntime asset checks:"
           $checks = @(
             'Tutorials\05-HelloSER\Raytracing.hlsl',
             'Tutorials\06-SakuraForestSER\Raytracing.hlsl',
