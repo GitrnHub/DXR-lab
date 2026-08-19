@@ -13,12 +13,14 @@ permissions:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Clone Microsoft DirectX samples
         shell: pwsh
-        run: git clone --depth 1 --branch master https://github.com/microsoft/DirectX-Graphics-Samples.git dxsamples
+        run: |
+          git clone --depth 1 --branch master https://github.com/microsoft/DirectX-Graphics-Samples.git dxsamples
+          Set-Content -Path microsoft-source-revision.txt -Value (git -C dxsamples rev-parse HEAD)
 
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v3
@@ -41,10 +43,10 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "NuGet restore failed for $($cfg.FullName)" }
           }
 
-      - name: Build tutorial samples Release x64
+      - name: Build seven tutorial samples into project-local output
         shell: pwsh
         run: |
-          $base = 'dxsamples\Samples\Desktop\D3D12Raytracing\src'
+          $base = (Resolve-Path 'dxsamples\Samples\Desktop\D3D12Raytracing\src').Path
           $projects = @(
             'D3D12RaytracingHelloWorld\D3D12RaytracingHelloWorld.vcxproj',
             'D3D12RaytracingSimpleLighting\D3D12RaytracingSimpleLighting.vcxproj',
@@ -56,70 +58,203 @@ jobs:
           )
 
           $summary = @()
-          $successCount = 0
           foreach ($relative in $projects) {
             $project = Join-Path $base $relative
             $name = Split-Path (Split-Path $project -Parent) -Leaf
             Write-Host "`n========== BUILD $name =========="
-            & msbuild $project /m:1 /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
-            if ($LASTEXITCODE -eq 0) {
-              $summary += "SUCCESS $name"
-              $successCount++
-            } else {
-              $summary += "FAILED  $name (exit $LASTEXITCODE)"
-              Write-Warning "$name failed; continuing with remaining samples."
+            & msbuild $project /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+            if ($LASTEXITCODE -ne 0) { throw "$name failed to build (exit $LASTEXITCODE)." }
+            $exe = Join-Path (Split-Path $project -Parent) "bin\x64\Release\$name.exe"
+            if (!(Test-Path $exe)) { throw "Expected executable not found: $exe" }
+            $summary += "SUCCESS $name"
+          }
+          $summary | Set-Content tutorial-build-summary.txt
+
+      - name: Build advanced RTAO sample
+        shell: pwsh
+        run: |
+          $project = (Resolve-Path 'dxsamples\Samples\Desktop\D3D12Raytracing\src\D3D12RaytracingRealTimeDenoisedAmbientOcclusion\D3D12RaytracingRealTimeDenoisedAmbientOcclusion.vcxproj').Path
+          & msbuild $project /m:1 /t:Rebuild /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { throw "RTAO sample failed to build (exit $LASTEXITCODE)." }
+          $exe = Join-Path (Split-Path $project -Parent) 'bin\x64\Release\D3D12RaytracingRealTimeDenoisedAmbientOcclusion.exe'
+          if (!(Test-Path $exe)) { throw "RTAO executable not found: $exe" }
+
+      - name: Build MiniEngine sample and dependencies
+        shell: pwsh
+        run: |
+          # Build through the official DXR solution so MiniEngine's SolutionDir-based
+          # shader/output paths and Core/Model project references are preserved.
+          $solution = (Resolve-Path 'dxsamples\Samples\Desktop\D3D12Raytracing\src\D3D12Raytracing.slnx').Path
+          & msbuild $solution /m:1 /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { throw "DXR solution / MiniEngine build failed (exit $LASTEXITCODE)." }
+          $exe = 'dxsamples\Samples\Desktop\D3D12Raytracing\Build\x64\Release\Output\D3D12RaytracingMiniEngineSample\D3D12RaytracingMiniEngineSample.exe'
+          if (!(Test-Path $exe)) { throw "MiniEngine executable not found: $exe" }
+
+      - name: Package nine self-contained runnable samples
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = (Resolve-Path 'dxsamples').Path
+          $src = Join-Path $root 'Samples\Desktop\D3D12Raytracing\src'
+          $stage = Join-Path $PWD 'DXR-Runnable-Samples'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'Tutorials') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'Advanced') | Out-Null
+
+          function Copy-RuntimeTree([string]$source, [string]$destination) {
+            New-Item -ItemType Directory -Force -Path $destination | Out-Null
+            # Preserve runtime-loaded HLSL/includes, models, textures, OMM binaries,
+            # sprite fonts and nested asset directories. Exclude build intermediates
+            # and C++/VS project files to keep the package readable.
+            Get-ChildItem $source -Recurse -File | ForEach-Object {
+              $relative = $_.FullName.Substring($source.Length).TrimStart('\')
+              if ($relative -match '(^|\\)(bin|obj|\.vs)(\\|$)') { return }
+              if ($_.Extension -in @('.cpp','.vcxproj','.filters','.user','.pdb','.lib','.exp')) { return }
+              if ($_.Name -eq 'packages.config') { return }
+              $target = Join-Path $destination $relative
+              $parent = Split-Path $target -Parent
+              New-Item -ItemType Directory -Force -Path $parent | Out-Null
+              Copy-Item $_.FullName $target -Force
             }
           }
 
-          $summary | Tee-Object -FilePath build-summary.txt
-          if ($successCount -eq 0) { throw 'No tutorial sample compiled successfully.' }
-
-      - name: Attempt complete solution including advanced samples
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          msbuild dxsamples\Samples\Desktop\D3D12Raytracing\src\D3D12Raytracing.slnx /m:1 /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
-
-      - name: Collect compiled samples
-        if: always()
-        shell: pwsh
-        run: |
-          $root = (Resolve-Path 'dxsamples').Path
-          $stage = Join-Path $PWD 'DXR-All-Samples'
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-
-          $src = Join-Path $root 'Samples\Desktop\D3D12Raytracing\src'
-          $releaseDirs = Get-ChildItem $src -Recurse -Directory | Where-Object {
-            $_.FullName -match '\\bin\\x64\\Release$'
+          function Write-Launchers([string]$destination, [string]$exeName) {
+            $run = @"
+          @echo off
+          cd /d "%~dp0"
+          start "" "%~dp0$exeName" %*
+          "@
+            $diag = @"
+          @echo off
+          cd /d "%~dp0"
+          echo Running $exeName from:
+          cd
+          echo.
+          "$exeName" %*
+          echo.
+          echo Exit code: %ERRORLEVEL%
+          pause
+          "@
+            Set-Content -Path (Join-Path $destination 'RUN.cmd') -Value $run -Encoding ascii
+            Set-Content -Path (Join-Path $destination 'RUN_DIAGNOSTIC.cmd') -Value $diag -Encoding ascii
           }
 
-          foreach ($dir in $releaseDirs) {
-            $projectName = Split-Path (Split-Path (Split-Path $dir.FullName -Parent) -Parent) -Leaf
-            $dest = Join-Path $stage $projectName
-            New-Item -ItemType Directory -Force -Path $dest | Out-Null
-            Copy-Item (Join-Path $dir.FullName '*') $dest -Recurse -Force -ErrorAction SilentlyContinue
+          $tutorials = @(
+            @{ Folder='01-HelloWorld'; Project='D3D12RaytracingHelloWorld'; Exe='D3D12RaytracingHelloWorld.exe' },
+            @{ Folder='02-SimpleLighting'; Project='D3D12RaytracingSimpleLighting'; Exe='D3D12RaytracingSimpleLighting.exe' },
+            @{ Folder='03-ProceduralGeometry'; Project='D3D12RaytracingProceduralGeometry'; Exe='D3D12RaytracingProceduralGeometry.exe' },
+            @{ Folder='04-LibrarySubobjects'; Project='D3D12RaytracingLibrarySubobjects'; Exe='D3D12RaytracingLibrarySubobjects.exe' },
+            @{ Folder='05-HelloSER'; Project='D3D12RaytracingHelloShaderExecutionReordering'; Exe='D3D12RaytracingHelloShaderExecutionReordering.exe' },
+            @{ Folder='06-SakuraForestSER'; Project='D3D12RaytracingSakuraForestSER'; Exe='D3D12RaytracingSakuraForestSER.exe' },
+            @{ Folder='07-OpacityMicromaps'; Project='D3D12RaytracingOpacityMicromaps'; Exe='D3D12RaytracingOpacityMicromaps.exe' }
+          )
+
+          foreach ($sample in $tutorials) {
+            $projectDir = Join-Path $src $sample.Project
+            $dest = Join-Path (Join-Path $stage 'Tutorials') $sample.Folder
+            Copy-RuntimeTree $projectDir $dest
+            $out = Join-Path $projectDir 'bin\x64\Release'
+            if (!(Test-Path $out)) { throw "Missing project-local output: $out" }
+            Copy-Item (Join-Path $out '*') $dest -Recurse -Force
+            if (!(Test-Path (Join-Path $dest $sample.Exe))) { throw "Packaged EXE missing: $($sample.Exe)" }
+            Write-Launchers $dest $sample.Exe
           }
 
-          $miniEngineOut = Join-Path $root 'Samples\Desktop\D3D12Raytracing\Build\x64\Release\Output'
-          if (Test-Path $miniEngineOut) {
-            $dest = Join-Path $stage 'Advanced-MiniEngine'
-            Copy-Item $miniEngineOut $dest -Recurse -Force
-          }
+          # Advanced 1: RTAO. The program loads Assets\... at runtime, so keep the
+          # full runtime tree beside the executable.
+          $rtaoProject = Join-Path $src 'D3D12RaytracingRealTimeDenoisedAmbientOcclusion'
+          $rtaoDest = Join-Path (Join-Path $stage 'Advanced') '01-RealTimeDenoisedAmbientOcclusion'
+          Copy-RuntimeTree $rtaoProject $rtaoDest
+          Copy-Item (Join-Path $rtaoProject 'bin\x64\Release\*') $rtaoDest -Recurse -Force
+          $rtaoExe = 'D3D12RaytracingRealTimeDenoisedAmbientOcclusion.exe'
+          if (!(Test-Path (Join-Path $rtaoDest $rtaoExe))) { throw 'Packaged RTAO EXE missing.' }
+          if (!(Test-Path (Join-Path $rtaoDest 'Assets'))) { throw 'Packaged RTAO Assets folder missing.' }
+          Write-Launchers $rtaoDest $rtaoExe
 
-          if (Test-Path 'build-summary.txt') {
-            Copy-Item 'build-summary.txt' (Join-Path $stage 'build-summary.txt') -Force
+          # Advanced 2: MiniEngine. Its source explicitly loads Sponza/sponza.h3d
+          # and model textures by relative path; these are not present in the raw
+          # Build\...\Output directory, so add them here.
+          $miniOut = Join-Path $root 'Samples\Desktop\D3D12Raytracing\Build\x64\Release\Output\D3D12RaytracingMiniEngineSample'
+          $miniProject = Join-Path $src 'D3D12RaytracingMiniEngineSample'
+          $miniDest = Join-Path (Join-Path $stage 'Advanced') '02-MiniEngine'
+          New-Item -ItemType Directory -Force -Path $miniDest | Out-Null
+          Copy-Item (Join-Path $miniOut '*') $miniDest -Recurse -Force
+          if (Test-Path (Join-Path $miniProject 'Textures')) {
+            Copy-Item (Join-Path $miniProject 'Textures') $miniDest -Recurse -Force
           }
+          $sponzaSource = Join-Path $root 'MiniEngine\ModelViewer\Sponza'
+          if (!(Test-Path $sponzaSource)) { throw "Sponza source folder missing: $sponzaSource" }
+          Copy-Item $sponzaSource $miniDest -Recurse -Force
+          $miniExe = 'D3D12RaytracingMiniEngineSample.exe'
+          if (!(Test-Path (Join-Path $miniDest $miniExe))) { throw 'Packaged MiniEngine EXE missing.' }
+          if (!(Test-Path (Join-Path $miniDest 'Sponza\sponza.h3d'))) { throw 'Packaged MiniEngine Sponza model missing.' }
+          if (!(Test-Path (Join-Path $miniDest 'Textures'))) { throw 'Packaged MiniEngine Textures folder missing.' }
+          Write-Launchers $miniDest $miniExe
 
-          Write-Host "`nCompiled executables:"
+          Copy-Item microsoft-source-revision.txt (Join-Path $stage 'microsoft-source-revision.txt') -Force
+          Copy-Item tutorial-build-summary.txt (Join-Path $stage 'tutorial-build-summary.txt') -Force
+
+          $rootReadme = @'
+          Microsoft DirectX Raytracing runnable samples - Release x64
+
+          IMPORTANT
+          =========
+          Do not move an EXE out of its sample folder. Several Microsoft samples
+          load HLSL, models, textures, fonts, OMM data, or PBRT assets by relative
+          path at runtime.
+
+          Recommended launch method:
+            1. Open one sample folder.
+            2. Double-click RUN.cmd.
+            3. If it closes immediately, use RUN_DIAGNOSTIC.cmd.
+
+          Layout
+          ======
+          Tutorials\01-HelloWorld
+          Tutorials\02-SimpleLighting
+          Tutorials\03-ProceduralGeometry
+          Tutorials\04-LibrarySubobjects
+          Tutorials\05-HelloSER
+          Tutorials\06-SakuraForestSER
+          Tutorials\07-OpacityMicromaps
+          Advanced\01-RealTimeDenoisedAmbientOcclusion
+          Advanced\02-MiniEngine
+
+          Modern feature note
+          ===================
+          HelloSER and Sakura Forest use Shader Model 6.9 / Shader Execution
+          Reordering. Opacity Micromaps requires DXR Tier 1.2. Use current Windows
+          updates and a current GPU driver.
+          '@
+          Set-Content -Path (Join-Path $stage 'README-RUN-FIRST.txt') -Value $rootReadme -Encoding utf8
+
+          Write-Host "`nPackaged executables:"
           $exes = Get-ChildItem $stage -Recurse -Filter *.exe -File
           $exes | ForEach-Object { Write-Host $_.FullName }
-          if ($exes.Count -eq 0) { throw 'No EXE files were collected.' }
+          if ($exes.Count -lt 9) { throw "Expected at least 9 sample EXEs, found $($exes.Count)." }
 
-      - name: Upload compiled DXR samples
-        if: always()
+          Write-Host "`nRuntime assets spot checks:"
+          $checks = @(
+            'Tutorials\05-HelloSER\Raytracing.hlsl',
+            'Tutorials\06-SakuraForestSER\Raytracing.hlsl',
+            'Tutorials\06-SakuraForestSER\trunk.obj',
+            'Tutorials\07-OpacityMicromaps\treeModel.bin',
+            'Tutorials\07-OpacityMicromaps\jacaranda_tree_leaves_alpha_4k.dds',
+            'Advanced\01-RealTimeDenoisedAmbientOcclusion\Assets',
+            'Advanced\02-MiniEngine\Sponza\sponza.h3d',
+            'Advanced\02-MiniEngine\Textures'
+          )
+          foreach ($check in $checks) {
+            $p = Join-Path $stage $check
+            if (!(Test-Path $p)) { throw "Required runtime asset missing: $check" }
+            Write-Host "OK  $check"
+          }
+
+      - name: Upload runnable DXR samples
         uses: actions/upload-artifact@v4
         with:
-          name: D3D12Raytracing-All-Samples-Release-x64
-          path: DXR-All-Samples/**
+          name: DXR-Runnable-Samples-Release-x64
+          path: DXR-Runnable-Samples/**
           if-no-files-found: error
+          compression-level: 6
           retention-days: 7
