@@ -2,8 +2,15 @@ name: Temporary XHS video fetch
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened]
     paths:
       - 'xhs-fetch-trigger.txt'
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
   fetch-video:
@@ -23,6 +30,7 @@ jobs:
             "$VIDEO_URL" -o temp_xhs/video.mp4
           ffprobe -v error -show_format -show_streams -of json temp_xhs/video.mp4 > temp_xhs/metadata.json
           ffmpeg -hide_banner -loglevel error -i temp_xhs/video.mp4 -vf 'fps=1,scale=960:-2' -q:v 3 frames/frame_%05d.jpg
+          ffmpeg -hide_banner -loglevel error -i temp_xhs/video.mp4 -vf "fps=0.5,scale=480:-2,tile=4x4" -frames:v 20 -q:v 4 temp_xhs/contact_%02d.jpg || true
 
       - name: Transcribe speech
         shell: bash
@@ -47,3 +55,12 @@ jobs:
             temp_xhs/
             frames/
           retention-days: 1
+
+      - name: Publish run id to issue
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/2/comments \
+            -f body="XHS_FETCH_RUN_ID=${{ github.run_id }} STATUS=${{ job.status }} SHA=${{ github.sha }}"
