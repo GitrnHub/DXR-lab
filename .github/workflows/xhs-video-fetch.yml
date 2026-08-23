@@ -5,37 +5,36 @@ on:
     paths:
       - '.github/workflows/xhs-video-fetch.yml'
 
+permissions:
+  contents: write
+
 jobs:
   fetch-video:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download source video
         shell: bash
         env:
           VIDEO_URL: 'https://sns-video-hw.xhscdn.com/spectrum/1040g3503243348gh6u0043rtn02tsl50dbg1egg'
         run: |
           set -euo pipefail
+          mkdir -p temp_xhs
           curl -L --fail --retry 3 --retry-all-errors \
             -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36' \
             -H 'Referer: https://www.xiaohongshu.com/' \
-            "$VIDEO_URL" -o video.mp4
-          ls -lh video.mp4
-          file video.mp4
+            "$VIDEO_URL" -o temp_xhs/video.mp4
+          ls -lh temp_xhs/video.mp4
+          file temp_xhs/video.mp4
 
-      - name: Inspect and extract frames
+      - name: Inspect and extract contact sheet
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v ffprobe >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y ffmpeg
-          fi
-          ffprobe -v error -show_format -show_streams -of json video.mp4 > metadata.json
-          mkdir -p frames
-          ffmpeg -hide_banner -loglevel error -i video.mp4 -vf 'fps=1,scale=960:-2' -q:v 3 frames/frame_%05d.jpg
-          printf 'frame_count=' > frame_count.txt
-          find frames -type f -name '*.jpg' | wc -l >> frame_count.txt
+          ffprobe -v error -show_format -show_streams -of json temp_xhs/video.mp4 > temp_xhs/metadata.json
+          ffmpeg -hide_banner -loglevel error -i temp_xhs/video.mp4 -vf "fps=1/2,scale=480:-2,tile=5x6" -frames:v 1 -q:v 3 temp_xhs/contact_sheet.jpg || true
 
       - name: Transcribe speech with faster-whisper
         shell: bash
@@ -43,37 +42,31 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --quiet faster-whisper
-          cat > transcribe.py <<'PY'
+          cat > /tmp/transcribe.py <<'PY'
           from faster_whisper import WhisperModel
           model = WhisperModel('small', device='cpu', compute_type='int8')
-          segments, info = model.transcribe('video.mp4', beam_size=5, vad_filter=True)
+          segments, info = model.transcribe('temp_xhs/video.mp4', beam_size=5, vad_filter=True)
           segs = list(segments)
-          with open('transcript.txt', 'w', encoding='utf-8') as f:
+          with open('temp_xhs/transcript.txt', 'w', encoding='utf-8') as f:
               f.write(f'language={info.language} probability={info.language_probability:.4f}\n')
               for s in segs:
                   f.write(f'[{s.start:.2f}-{s.end:.2f}] {s.text.strip()}\n')
-          def ts(t):
-              ms = int(round(t * 1000))
-              h, ms = divmod(ms, 3600000)
-              m, ms = divmod(ms, 60000)
-              sec, ms = divmod(ms, 1000)
-              return f'{h:02d}:{m:02d}:{sec:02d},{ms:03d}'
-          with open('transcript.srt', 'w', encoding='utf-8') as f:
-              for i, s in enumerate(segs, 1):
-                  f.write(f'{i}\n{ts(s.start)} --> {ts(s.end)}\n{s.text.strip()}\n\n')
           PY
-          python transcribe.py
+          python /tmp/transcribe.py
+
+      - name: Commit fetched material
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add temp_xhs
+          git commit -m 'Add temporary fetched XHS video material' || exit 0
+          git push
 
       - name: Upload analysis artifact
         uses: actions/upload-artifact@v4
         with:
           name: xhs-video-analysis
-          path: |
-            video.mp4
-            metadata.json
-            frame_count.txt
-            frames/
-            transcript.txt
-            transcript.srt
-          if-no-files-found: warn
+          path: temp_xhs/
           retention-days: 1
